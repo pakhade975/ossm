@@ -1,0 +1,98 @@
+# GIE conformance test image mirrors for IBM clusters (ppc64le / s390x).
+#
+# Applied before running the GIE conformance suite on IBM arch clusters.
+# Redirects upstream test images (docker.io, gcr.io) to quay.io/maistra
+# mirrors that carry ppc64le/s390x builds.
+#
+# NOTE: registry.k8s.io/gateway-api-inference-extension/epp is intentionally
+# excluded here. Its mirror is handled dynamically by config_gie.sh at runtime
+# (may include a locally-built image from build_epp_ibm.sh).
+#
+# Destination in jenkins-csb-declaration:
+#   resources/ocp/templates/olm/custom/mirrorSets/ibm/gie-conformance-registry-itms-idms.yaml
+---
+apiVersion: config.openshift.io/v1
+kind: ImageTagMirrorSet
+metadata:
+  name: gie-conformance-required-images
+spec:
+  imageTagMirrors:
+    - mirrors: [mirror.gcr.io/library/httpd]
+      source: docker.io/library/httpd
+    - mirrors: [mirror.gcr.io/curlimages/curl]
+      source: docker.io/curlimages/curl
+    - mirrors: [mirror.gcr.io/library/nginx]
+      source: docker.io/library/nginx
+    - mirrors: [mirror.gcr.io/library/redis]
+      source: docker.io/library/redis
+    - mirrors: [mirror.gcr.io/prom/prometheus]
+      source: docker.io/prom/prometheus
+    - mirrors: [quay.io/maistra/ratelimit_3.0]
+      source: docker.io/envoyproxy/ratelimit
+    - mirrors: [quay.io/maistra/fake-registry]
+      source: gcr.io/istio-testing/fake-registry
+    - mirrors: [quay.io/maistra/fake-registry]
+      source: registry.istio.io/testing/fake-registry
+    - mirrors: [mirror.gcr.io/openzipkin/zipkin-slim]
+      source: docker.io/openzipkin/zipkin-slim
+    - mirrors: [quay.io/maistra/jwt-server]
+      source: gcr.io/istio-testing/jwt-server
+    - mirrors: [quay.io/maistra/jwt-server]
+      source: registry.istio.io/testing/jwt-server
+    - mirrors: [quay.io/maistra/opentelemetry-collector]
+      source: docker.io/otel/opentelemetry-collector
+    - mirrors: [quay.io/maistra/echo-basic]
+      source: gcr.io/k8s-staging-gateway-api/echo-basic
+    - mirrors: [quay.io/maistra/echo-advanced]
+      source: gcr.io/k8s-staging-gateway-api/echo-advanced
+    - mirrors: [quay.io/maistra/go-httpbin]
+      source: docker.io/mccutchen/go-httpbin
+    - mirrors: [quay.io/maistra/ext-authz]
+      source: gcr.io/istio-testing/ext-authz
+      mirrorSourcePolicy: NeverContactSource
+    - mirrors: [quay.io/maistra/ext-authz]
+      source: registry.istio.io/testing/ext-authz
+      mirrorSourcePolicy: NeverContactSource
+---
+apiVersion: config.openshift.io/v1
+kind: ImageDigestMirrorSet
+metadata:
+  name: gie-conformance-required-images
+spec:
+  imageDigestMirrors:
+    - mirrors: [mirror.gcr.io/library/httpd]
+      source: docker.io/library/httpd
+    - mirrors: [mirror.gcr.io/curlimages/curl]
+      source: docker.io/curlimages/curl
+    - mirrors: [mirror.gcr.io/library/nginx]
+      source: docker.io/library/nginx
+    - mirrors: [mirror.gcr.io/library/redis]
+      source: docker.io/library/redis
+    - mirrors: [mirror.gcr.io/prom/prometheus]
+      source: docker.io/prom/prometheus
+    - mirrors: [quay.io/maistra/ratelimit_3.0]
+      source: docker.io/envoyproxy/ratelimit
+    - mirrors: [quay.io/maistra/fake-registry]
+      source: gcr.io/istio-testing/fake-registry
+    - mirrors: [quay.io/maistra/fake-registry]
+      source: registry.istio.io/testing/fake-registry
+    - mirrors: [mirror.gcr.io/openzipkin/zipkin-slim]
+      source: docker.io/openzipkin/zipkin-slim
+    - mirrors: [quay.io/maistra/jwt-server]
+      source: gcr.io/istio-testing/jwt-server
+    - mirrors: [quay.io/maistra/jwt-server]
+      source: registry.istio.io/testing/jwt-server
+    - mirrors: [quay.io/maistra/opentelemetry-collector]
+      source: docker.io/otel/opentelemetry-collector
+    - mirrors: [quay.io/maistra/echo-basic]
+      source: gcr.io/k8s-staging-gateway-api/echo-basic
+    - mirrors: [quay.io/maistra/echo-advanced]
+      source: gcr.io/k8s-staging-gateway-api/echo-advanced
+    - mirrors: [quay.io/maistra/go-httpbin]
+      source: docker.io/mccutchen/go-httpbin
+    - mirrors: [quay.io/maistra/ext-authz]
+      source: gcr.io/istio-testing/ext-authz
+      mirrorSourcePolicy: NeverContactSource
+    - mirrors: [quay.io/maistra/ext-authz]
+      source: registry.istio.io/testing/ext-authz
+      mirrorSourcePolicy: NeverContactSource
