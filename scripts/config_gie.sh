@@ -182,6 +182,28 @@ wait_for_cluster_operators() {
 }
 
 wait_for_mcp_rollout() {
+    # $1: UTC timestamp taken just BEFORE the ITMS/IDMS was applied, used to look
+    # for MachineConfigController errors logged since then.
+    # The MCO takes a few seconds to react to an IDMS/ITMS change. Without this
+    # grace period the check below can run first, see "Updated=True" and return
+    # before the rollout has even started.
+    log "waiting for MachineConfigPools to start updating (up to 180s)..."
+    local t0="${1:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" started=false start_deadline=$((SECONDS + 180))
+    while ((SECONDS < start_deadline)); do
+        oc get mcp -o json | jq -e '[.items[] | select(.status.conditions[]? | select(.type=="Updating" and .status=="True"))] | length > 0' >/dev/null \
+            && { started=true; break; }
+        sleep 5
+    done
+    # No rollout started: either nothing changed, or the MachineConfigController
+    # rejected the mirror sets (e.g. conflicting mirrorSourcePolicy). In the second
+    # case the pools stay Updated=True and nodes never get the new registries.conf.
+    if [[ "${started}" != "true" ]]; then
+        local mcc_err
+        mcc_err="$(oc logs -n openshift-machine-config-operator deploy/machine-config-controller \
+            -c machine-config-controller --since-time="${t0}" 2>/dev/null \
+            | grep 'Error syncing image config' | tail -1 || true)"
+        [[ -z "${mcc_err}" ]] || die "MachineConfigController rejected the mirror config, so nodes will not get it: ${mcc_err}"
+    fi
     log "waiting for MachineConfigPools to finish updating..."
     local deadline=$((SECONDS + 1800))
     while ((SECONDS < deadline)); do
@@ -421,99 +443,45 @@ EPP_MIRRORS="quay.io/maistra/epp"
 if [[ "${CLUSTER_ARCH}" == "ppc64le" || "${CLUSTER_ARCH}" == "s390x" ]] && \
    [[ "${SKIP_IBM_MIRROR}" != "true" ]]; then
     log "applying IDMS/ITMS for IBM cluster (arch: ${CLUSTER_ARCH})"
-    oc apply -f - <<EOF
-apiVersion: config.openshift.io/v1
-kind: ImageTagMirrorSet
-metadata:
-  name: gie-conformance-required-images
-spec:
-  imageTagMirrors:
-    - mirrors: [mirror.gcr.io/library/httpd]
-      source: docker.io/library/httpd
-    - mirrors: [mirror.gcr.io/curlimages/curl]
-      source: docker.io/curlimages/curl
-    - mirrors: [mirror.gcr.io/library/nginx]
-      source: docker.io/library/nginx
-    - mirrors: [mirror.gcr.io/library/redis]
-      source: docker.io/library/redis
-    - mirrors: [mirror.gcr.io/prom/prometheus]
-      source: docker.io/prom/prometheus
-    - mirrors: [quay.io/maistra/ratelimit_3.0]
-      source: docker.io/envoyproxy/ratelimit
-    - mirrors: [quay.io/maistra/fake-registry]
-      source: gcr.io/istio-testing/fake-registry
-    - mirrors: [quay.io/maistra/fake-registry]
-      source: registry.istio.io/testing/fake-registry
-    - mirrors: [mirror.gcr.io/openzipkin/zipkin-slim]
-      source: docker.io/openzipkin/zipkin-slim
-    - mirrors: [quay.io/maistra/jwt-server]
-      source: gcr.io/istio-testing/jwt-server
-    - mirrors: [quay.io/maistra/jwt-server]
-      source: registry.istio.io/testing/jwt-server
-    - mirrors: [quay.io/maistra/opentelemetry-collector]
-      source: docker.io/otel/opentelemetry-collector
-    - mirrors: [quay.io/maistra/echo-basic]
-      source: gcr.io/k8s-staging-gateway-api/echo-basic
-    - mirrors: [quay.io/maistra/echo-advanced]
-      source: gcr.io/k8s-staging-gateway-api/echo-advanced
-    - mirrors: [quay.io/maistra/go-httpbin]
-      source: docker.io/mccutchen/go-httpbin
-    - mirrors: [quay.io/maistra/ext-authz]
-      source: gcr.io/istio-testing/ext-authz
-      mirrorSourcePolicy: NeverContactSource
-    - mirrors: [quay.io/maistra/ext-authz]
-      source: registry.istio.io/testing/ext-authz
-      mirrorSourcePolicy: NeverContactSource
-    - mirrors: [${EPP_MIRRORS}]
-      source: registry.k8s.io/gateway-api-inference-extension/epp
----
-apiVersion: config.openshift.io/v1
-kind: ImageDigestMirrorSet
-metadata:
-  name: gie-conformance-required-images
-spec:
-  imageDigestMirrors:
-    - mirrors: [mirror.gcr.io/library/httpd]
-      source: docker.io/library/httpd
-    - mirrors: [mirror.gcr.io/curlimages/curl]
-      source: docker.io/curlimages/curl
-    - mirrors: [mirror.gcr.io/library/nginx]
-      source: docker.io/library/nginx
-    - mirrors: [mirror.gcr.io/library/redis]
-      source: docker.io/library/redis
-    - mirrors: [mirror.gcr.io/prom/prometheus]
-      source: docker.io/prom/prometheus
-    - mirrors: [quay.io/maistra/ratelimit_3.0]
-      source: docker.io/envoyproxy/ratelimit
-    - mirrors: [quay.io/maistra/fake-registry]
-      source: gcr.io/istio-testing/fake-registry
-    - mirrors: [quay.io/maistra/fake-registry]
-      source: registry.istio.io/testing/fake-registry
-    - mirrors: [mirror.gcr.io/openzipkin/zipkin-slim]
-      source: docker.io/openzipkin/zipkin-slim
-    - mirrors: [quay.io/maistra/jwt-server]
-      source: gcr.io/istio-testing/jwt-server
-    - mirrors: [quay.io/maistra/jwt-server]
-      source: registry.istio.io/testing/jwt-server
-    - mirrors: [quay.io/maistra/opentelemetry-collector]
-      source: docker.io/otel/opentelemetry-collector
-    - mirrors: [quay.io/maistra/echo-basic]
-      source: gcr.io/k8s-staging-gateway-api/echo-basic
-    - mirrors: [quay.io/maistra/echo-advanced]
-      source: gcr.io/k8s-staging-gateway-api/echo-advanced
-    - mirrors: [quay.io/maistra/go-httpbin]
-      source: docker.io/mccutchen/go-httpbin
-    - mirrors: [quay.io/maistra/ext-authz]
-      source: gcr.io/istio-testing/ext-authz
-      mirrorSourcePolicy: NeverContactSource
-    - mirrors: [quay.io/maistra/ext-authz]
-      source: registry.istio.io/testing/ext-authz
-      mirrorSourcePolicy: NeverContactSource
-    - mirrors: [${EPP_MIRRORS}]
-      source: registry.k8s.io/gateway-api-inference-extension/epp
-EOF
+    MIRROR_APPLY_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    IBM_MIRROR_YAML="${CSB_REPO_DIR}/resources/ocp/templates/olm/custom/mirrorSets/ibm/gie-conformance-registry-itms-idms.yaml"
+    [[ -f "${IBM_MIRROR_YAML}" ]] || die "missing ${IBM_MIRROR_YAML} (check --csb-repo-branch)"
+    # Another ITMS/IDMS on the cluster may already map the same source with a
+    # different mirrorSourcePolicy; the MCO then rejects ALL mirror changes.
+    # Align our policy with the existing one (mirrors are the same, only the
+    # policy differs). Our own object is excluded so re-runs stay idempotent.
+    EXISTING_POLICIES="$(oc get itms,idms -o json | jq -c --arg self gie-conformance-required-images '
+        reduce (.items[] | select(.metadata.name != $self)
+                | ((.spec.imageTagMirrors // []) + (.spec.imageDigestMirrors // []))[]) as $e
+            ({}; .[$e.source] = ($e.mirrorSourcePolicy // ""))')"
+    # `oc create --dry-run -o json` prints one JSON object per YAML document (or a
+    # List), so slurp the stream, flatten any List, then rewrite and re-wrap.
+    oc create --dry-run=client -f "${IBM_MIRROR_YAML}" -o json \
+        | jq -s --argjson ex "${EXISTING_POLICIES}" '
+            def fix:
+                . as $e
+                | if ($ex | has($e.source)) then
+                    (if $ex[$e.source] == "" then del(.mirrorSourcePolicy)
+                     else .mirrorSourcePolicy = $ex[$e.source] end)
+                  else . end;
+            {apiVersion: "v1", kind: "List",
+             items: (map(if .kind == "List" then .items[] else . end)
+                | map((if .spec.imageTagMirrors    then .spec.imageTagMirrors    |= map(fix) else . end)
+                    | (if .spec.imageDigestMirrors then .spec.imageDigestMirrors |= map(fix) else . end)))}' \
+        | oc apply -f -
+
+    # The epp mirror depends on whether a native build exists, so it is not in the
+    # shared YAML. Add it to the SAME objects (separate objects with the same
+    # source are not reliably merged by the MCO).
+    EPP_MIRRORS_JSON="$(printf '"%s",' ${EPP_MIRRORS//,/ })"
+    EPP_MIRRORS_JSON="${EPP_MIRRORS_JSON%,}"
+    for kind_field in "itms:imageTagMirrors" "idms:imageDigestMirrors"; do
+        oc patch "${kind_field%%:*}" gie-conformance-required-images --type=json \
+            -p "[{\"op\":\"add\",\"path\":\"/spec/${kind_field##*:}/-\",\"value\":{\"source\":\"registry.k8s.io/gateway-api-inference-extension/epp\",\"mirrors\":[${EPP_MIRRORS_JSON}]}}]"
+    done
+
     wait_for_cluster_operators
-    wait_for_mcp_rollout
+    wait_for_mcp_rollout "${MIRROR_APPLY_TS}"
 fi
 
 # ==============================================================================
@@ -525,40 +493,35 @@ case "${MIRROR_REGISTRY}" in
 none) ;;
 stage-registry)
     log "applying stage-registry mirror (registry.redhat.io/openshift-service-mesh* -> registry.stage.redhat.io/...)"
-    oc apply -f - <<'EOF'
-apiVersion: config.openshift.io/v1
-kind: ImageTagMirrorSet
-metadata:
-  name: stage-registry
-spec:
-  imageTagMirrors:
-    - mirrors: [registry.stage.redhat.io/openshift-service-mesh]
-      source: registry.redhat.io/openshift-service-mesh
-    - mirrors: [registry.stage.redhat.io/openshift-service-mesh-tech-preview]
-      source: registry.redhat.io/openshift-service-mesh-tech-preview
-    - mirrors: [registry.stage.redhat.io/openshift-service-mesh-dev-preview-beta]
-      source: registry.redhat.io/openshift-service-mesh-dev-preview-beta
----
-apiVersion: config.openshift.io/v1
-kind: ImageDigestMirrorSet
-metadata:
-  name: stage-registry
-spec:
-  imageDigestMirrors:
-    - mirrors: [registry.stage.redhat.io/openshift-service-mesh]
-      source: registry.redhat.io/openshift-service-mesh
-    - mirrors: [registry.stage.redhat.io/openshift-service-mesh-tech-preview]
-      source: registry.redhat.io/openshift-service-mesh-tech-preview
-    - mirrors: [registry.stage.redhat.io/openshift-service-mesh-dev-preview-beta]
-      source: registry.redhat.io/openshift-service-mesh-dev-preview-beta
-EOF
+    MIRROR_APPLY_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    oc apply -f "${CSB_REPO_DIR}/resources/ocp/templates/olm/custom/mirrorSets/stage-registry-idms.yaml"
     wait_for_cluster_operators
-    wait_for_mcp_rollout
+    wait_for_mcp_rollout "${MIRROR_APPLY_TS}"
     ;;
 *)
     die "invalid --mirror-registry: ${MIRROR_REGISTRY} (expected none|stage-registry)"
     ;;
 esac
+
+# ------------------------------------------------------------------------------
+# Verify the locally-built epp image is still in the internal registry.
+# The ImageStreamTag (istag) is only etcd metadata and survives when the
+# registry's emptyDir storage is wiped (e.g. the node reboots during the
+# MCP rollout above), so istag alone is not proof the image is pullable.
+# ------------------------------------------------------------------------------
+if [[ -n "${EPP_LOCAL_MIRROR}" ]]; then
+    REGISTRY_ROUTE="$(oc get route default-route -n openshift-image-registry -o jsonpath='{.spec.host}' 2>/dev/null || true)"
+    if command -v skopeo >/dev/null 2>&1 && [[ -n "${REGISTRY_ROUTE}" ]]; then
+        if skopeo inspect --tls-verify=false --creds "unused:$(oc whoami -t)" \
+            "docker://${REGISTRY_ROUTE}/${LOCAL_MIRROR_NAMESPACE}/epp:${EPP_TAG}" >/dev/null 2>&1; then
+            log "verified epp:${EPP_TAG} is present in the internal registry"
+        else
+            die "epp:${EPP_TAG} is no longer in the internal registry (its emptyDir storage was probably wiped by the node reboot). Re-run scripts/build_epp_ibm.sh --gie-version ${GIE_VERSION} --arch ${CLUSTER_ARCH}, then re-run this script."
+        fi
+    else
+        log "WARNING: cannot verify epp image in the internal registry (need skopeo and the registry default route)"
+    fi
+fi
 
 # ==============================================================================
 # Step 3: Custom CatalogSource (OCP < 4.22 with a candidate index image)
@@ -635,68 +598,62 @@ else
 fi
 
 # ==============================================================================
-# Step 6: Patch Istio images (OCP 4.22+ embedded install, OCP 4.x only)
+# Step 6: Patch Istio images (embedded install, OCP 4.22+ and 5.x)
 #         Matches 'Patch Istio Images for OCP 4.22+' stage.
-#         On OCP 5+, CIO manages the control plane — no patching needed.
+#         ISTIOD_IMAGE / PROXY_IMAGE come from konflux/ossm for --sail-version
+#         (resolve_istio_images). On OCP 5, CIO only creates istiod after the
+#         GatewayClass exists, so wait for it first. CVO and CIO are scaled
+#         down so they do not revert the patch.
 # ==============================================================================
 
 if [[ "${EMBEDDED_INSTALL}" == "true" ]]; then
-    if ((OCP_MAJOR_VERSION >= 5)); then
-        log "OCP 5 detected: CIO manages Istiod; waiting for it to provision after GatewayClass creation..."
-        timeout 600 bash -c \
-            "until oc get deployment/${ISTIOD_DEPLOY} -n ${INGRESS_NS} &>/dev/null; do
-                echo 'waiting for ${ISTIOD_DEPLOY} in ${INGRESS_NS}...'; sleep 10
-             done" || die "timed out waiting for CIO to provision deployment/${ISTIOD_DEPLOY}"
-        timeout 600 bash -c \
-            "until oc get configmap/${INJECTOR_CM} -n ${INGRESS_NS} &>/dev/null; do
-                echo 'waiting for ${INJECTOR_CM} in ${INGRESS_NS}...'; sleep 10
-             done" || die "timed out waiting for CIO to provision configmap/${INJECTOR_CM}"
-        log "CIO resources found; preserving their configuration."
-    else
-        log "patching Istio images for OCP 4.22+"
-        log "  ISTIOD_IMAGE: ${ISTIOD_IMAGE}"
-        log "  PROXY_IMAGE : ${PROXY_IMAGE}"
+    log "patching Istio images for OCP ${OCP_MAJOR_VERSION}"
+    log "  ISTIOD_IMAGE: ${ISTIOD_IMAGE}"
+    log "  PROXY_IMAGE : ${PROXY_IMAGE}"
 
-        log "waiting for deployment/${ISTIOD_DEPLOY} in ${INGRESS_NS}..."
-        timeout 600 bash -c \
-            "until oc get deployment/${ISTIOD_DEPLOY} -n ${INGRESS_NS} &>/dev/null; do
-                echo 'waiting for ${ISTIOD_DEPLOY}...'; sleep 10
-             done" || die "timed out waiting for deployment/${ISTIOD_DEPLOY}"
+    log "waiting for deployment/${ISTIOD_DEPLOY} and configmap/${INJECTOR_CM} in ${INGRESS_NS}..."
+    timeout 600 bash -c \
+        "until oc get deployment/${ISTIOD_DEPLOY} -n ${INGRESS_NS} &>/dev/null; do
+            echo 'waiting for ${ISTIOD_DEPLOY}...'; sleep 10
+         done" || die "timed out waiting for deployment/${ISTIOD_DEPLOY}"
+    timeout 600 bash -c \
+        "until oc get configmap/${INJECTOR_CM} -n ${INGRESS_NS} &>/dev/null; do
+            echo 'waiting for ${INJECTOR_CM}...'; sleep 10
+         done" || die "timed out waiting for configmap/${INJECTOR_CM}"
 
-        log "scaling down cluster-version-operator and ingress-operator"
-        oc scale --replicas=0 -n "${CVO_NS}" deployment/cluster-version-operator
-        oc scale --replicas=0 -n "${CIO_NS}" deployment/ingress-operator
-        oc rollout status -n "${CIO_NS}" deployment/ingress-operator --timeout=120s || true
+    log "scaling down cluster-version-operator and ingress-operator"
+    oc scale --replicas=0 -n "${CVO_NS}" deployment/cluster-version-operator
+    oc scale --replicas=0 -n "${CIO_NS}" deployment/ingress-operator
+    oc rollout status -n "${CIO_NS}" deployment/ingress-operator --timeout=120s || true
 
-        log "patching istiod image"
-        oc set image -n "${INGRESS_NS}" "deployment/${ISTIOD_DEPLOY}" discovery="${ISTIOD_IMAGE}"
+    log "patching istiod image"
+    oc set image -n "${INGRESS_NS}" "deployment/${ISTIOD_DEPLOY}" discovery="${ISTIOD_IMAGE}"
 
-        log "patching proxy image in configmap/${INJECTOR_CM}"
-        PATCHED_VALUES=$(oc get -n "${INGRESS_NS}" "configmap/${INJECTOR_CM}" -o json \
-            | jq -r --arg proxy "${PROXY_IMAGE}" '
-                .data.values |= (
-                    fromjson
-                    | .global.proxy.image = $proxy
-                    | .global.proxyInit.image = $proxy
-                    | tojson
-                )
-                | .data.values')
-        oc patch -n "${INGRESS_NS}" "configmap/${INJECTOR_CM}" --type merge \
-            -p "$(jq -n --arg values "${PATCHED_VALUES}" '{data: {values: $values}}')"
+    log "patching proxy image in configmap/${INJECTOR_CM}"
+    PATCHED_VALUES=$(oc get -n "${INGRESS_NS}" "configmap/${INJECTOR_CM}" -o json \
+        | jq -r --arg proxy "${PROXY_IMAGE}" '
+            .data.values |= (
+                fromjson
+                | .global.proxy.image = $proxy
+                | .global.proxyInit.image = $proxy
+                | tojson
+            )
+            | .data.values')
+    oc patch -n "${INGRESS_NS}" "configmap/${INJECTOR_CM}" --type merge \
+        -p "$(jq -n --arg values "${PATCHED_VALUES}" '{data: {values: $values}}')"
 
-        log "restarting deployment/${ISTIOD_DEPLOY}"
-        oc rollout restart -n "${INGRESS_NS}" "deployment/${ISTIOD_DEPLOY}"
-        oc rollout status -n "${INGRESS_NS}" "deployment/${ISTIOD_DEPLOY}" --timeout=300s
-        log "Istio images patched successfully"
+    log "restarting deployment/${ISTIOD_DEPLOY}"
+    oc rollout restart -n "${INGRESS_NS}" "deployment/${ISTIOD_DEPLOY}"
+    oc rollout status -n "${INGRESS_NS}" "deployment/${ISTIOD_DEPLOY}" --timeout=300s
+    log "Istio images patched successfully"
 
-        cat <<EOF
+    cat <<EOF
 
 NOTE: operators left scaled to 0 — restore once testing is complete:
   oc scale --replicas=1 -n ${CVO_NS} deployment/cluster-version-operator
   oc scale --replicas=1 -n ${CIO_NS} deployment/ingress-operator
 
 EOF
-    fi
 fi
 
 # ==============================================================================
