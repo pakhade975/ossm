@@ -19,7 +19,7 @@
 #   ./config_gie.sh \
 #       --sail-version 3.5.0 --istio-version 1.31.0 --gie-version 1.4.0
 #
-#   # OCP 4.22+, embedded CIO install (s390x/ppc64le, pre-GA):
+#   # OCP 4.22+, embedded CIO install (s390x, pre-GA):
 #   # Run build_epp_ibm.sh first, then:
 #   ./config_gie.sh \
 #       --sail-version 3.5.0 --istio-version 1.31.0 --gie-version 1.4.0
@@ -69,7 +69,7 @@ CSB_REPO_BRANCH="${CSB_REPO_BRANCH:-master}"
 CSB_REPO_DIR="${CSB_REPO_DIR:-$(pwd)/jenkins-csb-declaration}"
 
 MIRROR_REGISTRY="${MIRROR_REGISTRY:-none}"          # none|stage-registry
-SKIP_IBM_MIRROR="${SKIP_IBM_MIRROR:-false}"         # skip ppc64le/s390x IDMS/ITMS
+SKIP_IBM_MIRROR="${SKIP_IBM_MIRROR:-false}"         # skip s390x IDMS/ITMS
 LOCAL_MIRROR_NAMESPACE="${LOCAL_MIRROR_NAMESPACE:-gie-image-mirror}"  # namespace where build_epp_ibm.sh pushed the epp image
 
 GATEWAYCLASS_NAME="${GATEWAYCLASS_NAME:-openshift-default}"
@@ -127,8 +127,8 @@ GitLab repo options:
 Mirror options:
   --mirror-registry NAME     none|stage-registry (default: ${MIRROR_REGISTRY})
                               Use stage-registry when testing pre-GA OSSM images.
-  --skip-ibm-mirror          Skip the ppc64le/s390x IDMS/ITMS
-                              (auto-applied when cluster arch is ppc64le/s390x)
+  --skip-ibm-mirror          Skip the s390x IDMS/ITMS
+                              (auto-applied when cluster arch is s390x)
 
 General:
   --gateway-class NAME       GatewayClass name (default: ${GATEWAYCLASS_NAME})
@@ -404,7 +404,7 @@ git -C "${GIE_REPO_DIR}" checkout "v${GIE_VERSION}"
 BASE_MANIFEST="${GIE_REPO_DIR}/conformance/resources/base.yaml"
 
 # ==============================================================================
-# Step 2: IBM mirror sets for ppc64le / s390x clusters
+# Step 2: IBM mirror sets for s390x clusters
 #         Matches 'Check IDMS/ITMS for IBM clusters' stage in Jenkinsfile.
 #
 #         EPP mirror decision logic:
@@ -421,7 +421,7 @@ BASE_MANIFEST="${GIE_REPO_DIR}/conformance/resources/base.yaml"
 # Detect the epp tag base.yaml references and whether it is already in the
 # cluster's internal registry (pushed there by build_epp_ibm.sh).
 EPP_LOCAL_MIRROR=""
-if [[ "${CLUSTER_ARCH}" == "ppc64le" || "${CLUSTER_ARCH}" == "s390x" ]] && \
+if [[ "${CLUSTER_ARCH}" == "s390x" ]] && \
    [[ "${SKIP_IBM_MIRROR}" != "true" ]] && [[ -f "${BASE_MANIFEST}" ]]; then
     EPP_TAG="$(grep -oE 'registry\.k8s\.io/gateway-api-inference-extension/epp:[A-Za-z0-9._-]+' \
         "${BASE_MANIFEST}" 2>/dev/null | head -1 | cut -d: -f2 || true)"
@@ -440,7 +440,7 @@ fi
 EPP_MIRRORS="quay.io/maistra/epp"
 [[ -n "${EPP_LOCAL_MIRROR}" ]] && EPP_MIRRORS="${EPP_LOCAL_MIRROR}, ${EPP_MIRRORS}"
 
-if [[ "${CLUSTER_ARCH}" == "ppc64le" || "${CLUSTER_ARCH}" == "s390x" ]] && \
+if [[ "${CLUSTER_ARCH}" == "s390x" ]] && \
    [[ "${SKIP_IBM_MIRROR}" != "true" ]]; then
     log "applying IDMS/ITMS for IBM cluster (arch: ${CLUSTER_ARCH})"
     MIRROR_APPLY_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
