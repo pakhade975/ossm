@@ -240,6 +240,13 @@ timeout 180 bash -c \
     'until oc get route default-route -n openshift-image-registry &>/dev/null; do sleep 5; done' ||
     die "timed out waiting for the internal image registry default route"
 
+# The ClusterOperator can report Available and the route can exist before the
+# registry pod is serving, in which case the router answers 503. Wait up to
+# 1 minute for the registry deployment to be ready.
+log "waiting up to 60s for the image-registry pod to be ready..."
+oc rollout status deployment/image-registry -n openshift-image-registry --timeout=60s ||
+    die "image-registry deployment not ready after 60s"
+
 ROUTE="$(oc get route default-route -n openshift-image-registry -o jsonpath='{.spec.host}')"
 log "internal registry route: ${ROUTE}"
 
