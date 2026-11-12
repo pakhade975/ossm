@@ -84,6 +84,7 @@ DEBUG="${DEBUG:-false}"
 
 GIE_REPO_DIR="${GIE_REPO_DIR:-$(pwd)/gateway-api-inference-extension}"
 REPORT_DIR="${REPORT_DIR:-$(pwd)/to-archive}"
+GO_JUNIT_REPORT_VERSION="${GO_JUNIT_REPORT_VERSION:-v2.1.0}"
 
 ISTIOD_DEPLOY="istiod-${REVISION}"
 INJECTOR_CM="istio-sidecar-injector-${REVISION}"
@@ -260,7 +261,7 @@ resolve_istio_images() {
         return 0
     }
 
-    local major minor mm ref export_file tmp_dir
+    local major minor mm ref export_file tmp_dir export_script
     IFS='.' read -r major minor _ <<<"${SAIL_VERSION}"
     mm="${major}.${minor}"
 
@@ -276,21 +277,21 @@ resolve_istio_images() {
         git remote add origin "${KONFLUX_REPO_URL}"
         git fetch --depth 1 origin "${ref}" 2>&1 | grep -v "^From" || true
         git show FETCH_HEAD:"${export_file}" > export-images.sh
-    ) || die "failed to fetch ${export_file} from ${KONFLUX_REPO_URL} ref=${ref}"
+    ) || { rm -rf "${tmp_dir}"; die "failed to fetch ${export_file} from ${KONFLUX_REPO_URL} ref=${ref}"; }
+    # Read the script into memory and drop the temp dir now, so no die below leaks it.
+    export_script="$(cat "${tmp_dir}/export-images.sh")"
+    rm -rf "${tmp_dir}"
 
-    # Source only the ISTIO_PILOT_* and ISTIO_PROXY_* variables — ignore everything else
-    local pilot_var proxy_var istio_minor
-    istio_minor="${minor}"
-    pilot_var="$(grep -oE "ISTIO_PILOT_[0-9_]+" "${tmp_dir}/export-images.sh" | head -1)"
-    proxy_var="$(grep -oE "ISTIO_PROXY_[0-9_]+" "${tmp_dir}/export-images.sh" | head -1)"
+    # Extract only the ISTIO_PILOT_* and ISTIO_PROXY_* variables — ignore everything else
+    local pilot_var proxy_var
+    pilot_var="$(grep -oE "ISTIO_PILOT_[0-9_]+" <<<"${export_script}" | head -1)"
+    proxy_var="$(grep -oE "ISTIO_PROXY_[0-9_]+" <<<"${export_script}" | head -1)"
 
     [[ -n "${pilot_var}" ]] || die "could not find ISTIO_PILOT_* variable in ${export_file}"
     [[ -n "${proxy_var}" ]] || die "could not find ISTIO_PROXY_* variable in ${export_file}"
 
-    ISTIOD_IMAGE="$(grep "^export ${pilot_var}=" "${tmp_dir}/export-images.sh" | cut -d'"' -f2)"
-    PROXY_IMAGE="$(grep  "^export ${proxy_var}="  "${tmp_dir}/export-images.sh" | cut -d'"' -f2)"
-
-    rm -rf "${tmp_dir}"
+    ISTIOD_IMAGE="$(grep "^export ${pilot_var}=" <<<"${export_script}" | cut -d'"' -f2)"
+    PROXY_IMAGE="$(grep  "^export ${proxy_var}="  <<<"${export_script}" | cut -d'"' -f2)"
 
     [[ -n "${ISTIOD_IMAGE}" ]] || die "could not parse ${pilot_var} from ${export_file}"
     [[ -n "${PROXY_IMAGE}" ]]  || die "could not parse ${proxy_var} from ${export_file}"
@@ -377,7 +378,14 @@ log "Install mode: $([[ "${EMBEDDED_INSTALL}" == "true" ]] && echo "embedded (CI
 # ==============================================================================
 
 log "cloning jenkins-csb-declaration (${CSB_REPO_URL}, branch: ${CSB_REPO_BRANCH})"
-rm -rf "${CSB_REPO_DIR}"
+# The directory is deleted and re-cloned every run: refuse anything that is not
+# clearly a previous clone of this repo, so a mistyped --csb-repo-dir cannot
+# remove unrelated files.
+[[ -n "${CSB_REPO_DIR}" && "${CSB_REPO_DIR}" != "/" ]] || die "invalid --csb-repo-dir: '${CSB_REPO_DIR}'"
+if [[ -e "${CSB_REPO_DIR}" && ! -d "${CSB_REPO_DIR}/.git" ]]; then
+    die "refusing to delete ${CSB_REPO_DIR}: it exists but is not a git checkout"
+fi
+rm -rf "${CSB_REPO_DIR:?}"
 git clone -b "${CSB_REPO_BRANCH}" "${CSB_REPO_URL}" "${CSB_REPO_DIR}"
 
 GIE_GATEWAYCLASS_YAML="${CSB_REPO_DIR}/resources/install/gieGatewayClass.yaml"
@@ -394,6 +402,9 @@ GIE_DESTINATION_RULES_YAML="${CSB_REPO_DIR}/resources/install/gieDestinationRule
 
 if [[ -d "${GIE_REPO_DIR}/.git" ]]; then
     log "reusing existing GIE checkout at ${GIE_REPO_DIR}"
+    # A previous run that did not exit cleanly can leave base.yaml patched
+    # (Step 8 below). Reset it so it is never carried into this run.
+    git -C "${GIE_REPO_DIR}" checkout -q -- conformance/resources/base.yaml 2>/dev/null || true
     git -C "${GIE_REPO_DIR}" fetch --tags
 else
     log "cloning gateway-api-inference-extension into ${GIE_REPO_DIR}"
@@ -508,19 +519,43 @@ esac
 # The ImageStreamTag (istag) is only etcd metadata and survives when the
 # registry's emptyDir storage is wiped (e.g. the node reboots during the
 # MCP rollout above), so istag alone is not proof the image is pullable.
+#
+# Returns: 0 = present, 1 = missing, 2 = could not verify (no skopeo, no route,
+# no user token e.g. client-certificate login, or no ingress CA).
+# TLS is verified against the cluster's ingress CA, and the token is passed on
+# stdin into a temporary authfile (never on the command line).
 # ------------------------------------------------------------------------------
-if [[ -n "${EPP_LOCAL_MIRROR}" ]]; then
-    REGISTRY_ROUTE="$(oc get route default-route -n openshift-image-registry -o jsonpath='{.spec.host}' 2>/dev/null || true)"
-    if command -v skopeo >/dev/null 2>&1 && [[ -n "${REGISTRY_ROUTE}" ]]; then
-        if skopeo inspect --tls-verify=false --creds "unused:$(oc whoami -t)" \
-            "docker://${REGISTRY_ROUTE}/${LOCAL_MIRROR_NAMESPACE}/epp:${EPP_TAG}" >/dev/null 2>&1; then
-            log "verified epp:${EPP_TAG} is present in the internal registry"
+check_epp_in_registry() {
+    local route token dir rc=2
+    route="$(oc get route default-route -n openshift-image-registry -o jsonpath='{.spec.host}' 2>/dev/null || true)"
+    token="$(oc whoami -t 2>/dev/null || true)"
+    command -v skopeo >/dev/null 2>&1 && [[ -n "${route}" && -n "${token}" ]] || return 2
+
+    dir="$(mktemp -d)"
+    oc get configmap default-ingress-cert -n openshift-config-managed \
+        -o jsonpath='{.data.ca-bundle\.crt}' >"${dir}/ca.crt" 2>/dev/null || true
+    if [[ -s "${dir}/ca.crt" ]] && \
+       printf '%s' "${token}" | skopeo login --authfile "${dir}/auth.json" --cert-dir "${dir}" \
+           -u unused --password-stdin "${route}" >/dev/null 2>&1; then
+        if skopeo inspect --authfile "${dir}/auth.json" --cert-dir "${dir}" \
+            "docker://${route}/${LOCAL_MIRROR_NAMESPACE}/epp:${EPP_TAG}" >/dev/null 2>&1; then
+            rc=0
         else
-            die "epp:${EPP_TAG} is no longer in the internal registry (its emptyDir storage was probably wiped by the node reboot). Re-run scripts/build_epp_ibm.sh --gie-version ${GIE_VERSION} --arch ${CLUSTER_ARCH}, then re-run this script."
+            rc=1
         fi
-    else
-        log "WARNING: cannot verify epp image in the internal registry (need skopeo and the registry default route)"
     fi
+    rm -rf "${dir}"
+    return "${rc}"
+}
+
+if [[ -n "${EPP_LOCAL_MIRROR}" ]]; then
+    epp_rc=0
+    check_epp_in_registry || epp_rc=$?
+    case "${epp_rc}" in
+    0) log "verified epp:${EPP_TAG} is present in the internal registry" ;;
+    1) die "epp:${EPP_TAG} is no longer in the internal registry (its emptyDir storage was probably wiped by the node reboot). Re-run scripts/build_epp_ibm.sh --gie-version ${GIE_VERSION} --arch ${CLUSTER_ARCH}, then re-run this script." ;;
+    *) log "WARNING: cannot verify epp image in the internal registry (need skopeo, the registry default route, a user token and the ingress CA)" ;;
+    esac
 fi
 
 # ==============================================================================
@@ -701,8 +736,8 @@ fi
 mkdir -p "${REPORT_DIR}"
 
 if ! command -v go-junit-report &>/dev/null; then
-    log "installing go-junit-report"
-    go install github.com/jstemmer/go-junit-report/v2@latest
+    log "installing go-junit-report ${GO_JUNIT_REPORT_VERSION}"
+    go install "github.com/jstemmer/go-junit-report/v2@${GO_JUNIT_REPORT_VERSION}"
 fi
 export PATH="${PATH}:$(go env GOPATH)/bin"
 

@@ -1,13 +1,13 @@
 #!/bin/bash
 # Script: build_epp_ibm.sh
-# Purpose: Build a native ppc64le/s390x EPP image from GIE source and push it
+# Purpose: Build a native s390x EPP image from GIE source and push it
 #          into the target cluster's internal image registry so that
 #          config_gie.sh can mirror it via IDMS/ITMS on the test run.
 #
 # WHY THIS EXISTS:
 #   upstream GIE publishes multi-arch images for echo-basic, echo-advanced, and
 #   epp — but quay.io/maistra only carries a handful of manually-built
-#   ppc64le/s390x tags that lag behind whatever tag a given GIE_VERSION's
+#   s390x tags that lag behind whatever tag a given GIE_VERSION's
 #   conformance/resources/base.yaml references. When the tags diverge, this
 #   script builds EPP natively (no emulation) from the exact GIE source tree
 #   and pushes it into the cluster's own internal registry under the exact tag
@@ -15,7 +15,7 @@
 #   cluster's IDMS/ITMS so conformance pods pull from there automatically.
 #
 # MUST BE RUN ON:
-#   A native ppc64le or s390x host (or a host with podman manifest support).
+#   A native s390x host (or a host with podman manifest support).
 #   The host must have: podman, skopeo, git, oc
 #
 # WORKFLOW:
@@ -36,8 +36,8 @@
 #   # s390x cluster, GIE 1.4.0:
 #   ./build_epp_ibm.sh --gie-version 1.4.0 --arch s390x
 #
-#   # ppc64le cluster, GIE 1.4.0, push to a specific namespace:
-#   ./build_epp_ibm.sh --gie-version 1.4.0 --arch ppc64le \
+#   # s390x cluster, GIE 1.4.0, push to a specific namespace:
+#   ./build_epp_ibm.sh --gie-version 1.4.0 --arch s390x \
 #       --mirror-namespace my-mirror-ns
 
 set -euo pipefail
@@ -47,7 +47,7 @@ set -euo pipefail
 # ==============================================================================
 
 GIE_VERSION="${GIE_VERSION:-}"
-ARCH="${ARCH:-}"                                         # s390x|ppc64le
+ARCH="${ARCH:-}"                                         # s390x
 GIE_REPO_DIR="${GIE_REPO_DIR:-$(pwd)/gateway-api-inference-extension}"
 LOCAL_MIRROR_NAMESPACE="${LOCAL_MIRROR_NAMESPACE:-gie-image-mirror}"
 IMAGE_TAG="${IMAGE_TAG:-}"                               # auto-detected from base.yaml if empty
@@ -68,7 +68,7 @@ Usage: $(basename "$0") [options]
 
 Required:
   --gie-version VERSION   GIE tag to build EPP from (e.g. 1.4.0)
-  --arch ARCH             Target architecture: s390x or ppc64le
+  --arch ARCH             Target architecture: s390x
 
 Optional:
   --image-tag TAG         Image tag to push under in the cluster registry.
@@ -82,7 +82,7 @@ Optional:
   --skip-push             Build the image locally but do not push to the cluster
   -h, --help              Show this help
 
-Prerequisites (must be run on a native ppc64le/s390x host):
+Prerequisites (must be run on a native s390x host):
   - podman
   - skopeo
   - git
@@ -112,8 +112,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "${GIE_VERSION}" ]] || die "--gie-version is required"
-[[ -n "${ARCH}" ]]        || die "--arch is required (s390x or ppc64le)"
-[[ "${ARCH}" == "s390x" || "${ARCH}" == "ppc64le" ]] || die "--arch must be s390x or ppc64le (got: ${ARCH})"
+[[ -n "${ARCH}" ]]        || die "--arch is required (s390x)"
+[[ "${ARCH}" == "s390x" ]] || die "--arch must be s390x (got: ${ARCH}); config_gie.sh only wires the epp mirror on s390x"
 
 for bin in podman skopeo git oc; do
     command -v "${bin}" >/dev/null 2>&1 || die "${bin} not found in PATH"
@@ -250,7 +250,11 @@ log "internal registry route: ${ROUTE}"
 log "ensuring namespace ${LOCAL_MIRROR_NAMESPACE} exists..."
 oc create namespace "${LOCAL_MIRROR_NAMESPACE}" >/dev/null 2>&1 || true
 
-# Grant anonymous pull if the group exists (not available on all clusters)
+# Grant anonymous pull if the group exists (not available on all clusters).
+# This is deliberate: the nodes pull the epp image from the in-cluster registry
+# through the IDMS/ITMS mirror, and the node pull secret carries no credentials
+# for that registry. The grant is limited to read-only pull (system:image-puller)
+# on this one test namespace, which only holds the epp image built here.
 log "granting anonymous image-pull access on ${LOCAL_MIRROR_NAMESPACE} (if supported)..."
 oc adm policy add-role-to-group system:image-puller system:unauthenticated \
     -n "${LOCAL_MIRROR_NAMESPACE}" 2>/dev/null || \
@@ -260,10 +264,20 @@ oc adm policy add-role-to-group system:image-puller system:unauthenticated \
 # Step 6: Log in to the internal registry and push
 # ==============================================================================
 
+# TLS is verified against the cluster's ingress CA (the default route serves the
+# default ingress certificate). The SA token is passed on stdin into a temporary
+# authfile, never on the command line, and the files are removed on exit.
+SKOPEO_DIR="$(mktemp -d)"
+trap 'rm -rf "${SKOPEO_DIR}"' EXIT
+oc get configmap default-ingress-cert -n openshift-config-managed \
+    -o jsonpath='{.data.ca-bundle\.crt}' >"${SKOPEO_DIR}/ca.crt" 2>/dev/null || true
+[[ -s "${SKOPEO_DIR}/ca.crt" ]] || die "could not read the ingress CA (configmap default-ingress-cert in openshift-config-managed); cannot verify the registry TLS certificate"
+
 log "logging skopeo into ${ROUTE} using builder SA token..."
 SA_TOKEN="$(oc create token builder -n "${LOCAL_MIRROR_NAMESPACE}" 2>/dev/null \
     || oc serviceaccounts get-token builder -n "${LOCAL_MIRROR_NAMESPACE}")"
-skopeo login --tls-verify=false -u builder -p "${SA_TOKEN}" "${ROUTE}"
+printf '%s' "${SA_TOKEN}" | skopeo login --authfile "${SKOPEO_DIR}/auth.json" \
+    --cert-dir "${SKOPEO_DIR}" -u builder --password-stdin "${ROUTE}"
 
 DEST_IMAGE="${ROUTE}/${LOCAL_MIRROR_NAMESPACE}/epp:${IMAGE_TAG}"
 log "pushing ${FULL_LOCAL_IMAGE} -> ${DEST_IMAGE} (preserving ${ARCH} arch metadata)"
@@ -271,7 +285,8 @@ log "pushing ${FULL_LOCAL_IMAGE} -> ${DEST_IMAGE} (preserving ${ARCH} arch metad
 # preserved in the destination manifest. podman push can lose the arch
 # annotation causing Exec format error when the node pulls the image.
 skopeo copy \
-    --dest-tls-verify=false \
+    --dest-authfile "${SKOPEO_DIR}/auth.json" \
+    --dest-cert-dir "${SKOPEO_DIR}" \
     --override-arch "${ARCH}" \
     "containers-storage:${FULL_LOCAL_IMAGE}" \
     "docker://${DEST_IMAGE}"
